@@ -43,81 +43,129 @@ def browse(payload):
     raise RuntimeError("browse request failed after retries: %r" % last_exc)
 
 
-def parse_renderer(item):
-    r = item.get("playlistVideoRenderer") or {}
-    vid = r.get("videoId", "")
+def walk(obj, key):
+    """Recursively yield every value found under `key` in nested dict/list."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key:
+                yield v
+            else:
+                yield from walk(v, key)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from walk(item, key)
 
+
+def parse_lockup(l):
+    vid = l.get("contentId", "") or ""
+    title = ""
+    author = ""
+    length = ""
+    md = l.get("metadata") or {}
+    lmv = md.get("lockupMetadataViewModel") or {}
+    t = lmv.get("title") or {}
+    title = (t.get("content") or "").strip()
+    img = lmv.get("image") or {}
+    dav = img.get("decoratedAvatarViewModel") or {}
+    a11y = dav.get("a11yLabel") or ""
+    if a11y.startswith("Go to channel "):
+        author = a11y[len("Go to channel "):]
+    elif a11y:
+        author = a11y
+    cimg = l.get("contentImage") or {}
+    tvm = cimg.get("thumbnailViewModel") or {}
+    overlays = tvm.get("overlays") or []
+    for ov in overlays:
+        bo = ov.get("thumbnailBottomOverlayViewModel")
+        if bo:
+            badges = bo.get("badges") or []
+            for b in badges:
+                tb = b.get("thumbnailBadgeViewModel") or {}
+                txt = tb.get("text")
+                if txt and ":" in txt:
+                    length = txt
+                    break
+        if length:
+            break
+    return {"videoId": vid, "title": title, "author": author, "length": length}
+
+
+def parse_old(r):
+    vid = r.get("videoId", "") or ""
     title = ""
     t = r.get("title") or {}
     if t.get("runs"):
         title = t["runs"][0].get("text", "")
     elif t.get("simpleText"):
         title = t["simpleText"]
-
     author = ""
     b = r.get("shortBylineText") or {}
     if b.get("runs"):
         author = b["runs"][0].get("text", "")
     elif b.get("simpleText"):
         author = b["simpleText"]
-
     length = ""
     lt = r.get("lengthText") or {}
     if isinstance(lt, dict):
         length = lt.get("simpleText", "") or ""
+    return {"videoId": vid, "title": title, "author": author, "length": length}
 
-    index = ""
-    ix = r.get("index") or {}
-    if isinstance(ix, dict):
-        index = ix.get("simpleText", "") or ""
 
-    return {
-        "index": index,
-        "videoId": vid,
-        "title": title,
-        "author": author,
-        "length": length,
-    }
+def extract_videos(data):
+    videos = []
+    for l in walk(data, "lockupViewModel"):
+        if isinstance(l, dict) and l.get("contentId"):
+            videos.append(parse_lockup(l))
+    for r in walk(data, "playlistVideoRenderer"):
+        if isinstance(r, dict) and r.get("videoId"):
+            videos.append(parse_old(r))
+    return videos
+
+
+def extract_token(data):
+    for ncd in walk(data, "nextContinuationData"):
+        if isinstance(ncd, dict) and ncd.get("continuation"):
+            return ncd["continuation"]
+    for cc in walk(data, "continuationCommand"):
+        if isinstance(cc, dict) and cc.get("token"):
+            return cc["token"]
+    return None
 
 
 def main():
     videos = []
+    seen = set()
     payload = {"context": CONTEXT, "browseId": "VL" + PLAYLIST_ID}
     page = 0
     while True:
         page += 1
         print("fetching page %d ..." % page, file=sys.stderr)
         data = browse(payload)
-
-        if page == 1:
-            tabs = data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
-            tab = tabs[0]["tabRenderer"]
-            sections = tab["content"]["sectionListRenderer"]["contents"]
-            plr = sections[0]["playlistVideoListRenderer"]
-        else:
-            plr = data["continuationContents"]["playlistVideoListContinuation"]
-
-        for item in plr.get("contents", []):
-            if "playlistVideoRenderer" in item:
-                videos.append(parse_renderer(item))
-
-        continuations = plr.get("continuations") or []
-        if not continuations:
+        batch = extract_videos(data)
+        new = 0
+        for v in batch:
+            if v["videoId"] and v["videoId"] not in seen:
+                seen.add(v["videoId"])
+                v["index"] = len(videos)
+                videos.append(v)
+                new += 1
+        print("page %d: %d items (%d new), total %d" % (page, len(batch), new, len(videos)), file=sys.stderr)
+        token = extract_token(data)
+        if not token:
             break
-        token = continuations[0]["nextContinuationData"]["continuation"]
         payload = {"context": CONTEXT, "continuation": token}
         time.sleep(0.8)
+        if page >= 10:
+            print("page safety limit reached", file=sys.stderr)
+            break
 
-    result = {
-        "playlistId": PLAYLIST_ID,
-        "count": len(videos),
-        "videos": videos,
-    }
+    result = {"playlistId": PLAYLIST_ID, "count": len(videos), "videos": videos}
     with open("playlist.json", "w", encoding="utf-8") as fh:
         json.dump(result, fh, ensure_ascii=False, indent=2)
 
+    line = json.dumps(result, ensure_ascii=False)
     print("===PLAYLIST_JSON_BEGIN===")
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(line)
     print("===PLAYLIST_JSON_END===")
     print("total videos:", len(videos), file=sys.stderr)
 
